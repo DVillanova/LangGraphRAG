@@ -1,0 +1,13 @@
+NOTES: Model seems to get stuck when giving wrong answers, unable to redirect behavior towards user suggestions. Try to fix this.
+
+
+Verify:
+- Model works correctly when asking for information contained in a Table / Image in a document
+
+Urgent:
+- Add citations in LLM response (if possible, document and page number)
+- Move to graphical UI, hosted in local webpage (?)
+
+Optional:
+- Use Lingua instead of langdetect
+
