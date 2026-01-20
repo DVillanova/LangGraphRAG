@@ -37,8 +37,12 @@ Formula una pregunta mejorada:"""
 
 GENERATE_PROMPT = """Eres un asistente para tareas de respuesta a preguntas. Utiliza los siguientes 
 fragmentos de contexto recuperado para responder la pregunta. Si no sabes la respuesta, simplemente 
-di que no lo sabes. Mantén la respuesta concisa, pero no olvides ningún detalle relevante. Cita la referencia
-del documento en la respuesta.
+di que no lo sabes. Mantén la respuesta concisa, pero no olvides ningún detalle relevante.
+
+IMPORTANTE: Siempre cita la fuente y el número de página cuando respondas. Usa el formato:
+[Fuente: nombre_archivo.pdf, Página: X]
+
+Si múltiples fuentes contienen información relevante, cítalas todas.
 
 Pregunta: {question}
 
@@ -55,14 +59,15 @@ Por favor, intenta reformular tu pregunta con más detalle o utilizando término
 También puedes verificar que el documento relevante esté indexado usando el comando `rag list`."""
 
 # System message for conversation context
-SYSTEM_MESSAGE = """Eres un asistente experto que responde preguntas basándose en documentos indexados.
+SYSTEM_MESSAGE = """Eres un asistente experto que responde preguntas basándose ÚNICAMENTE en documentos indexados.
 Tienes acceso a una herramienta de búsqueda que te permite recuperar información relevante de los documentos.
 
-Instrucciones importantes:
-- Usa la herramienta de búsqueda para encontrar información antes de responder preguntas sobre documentos
+Instrucciones CRÍTICAS:
+- DEBES usar la herramienta de búsqueda para TODAS las preguntas sobre contenido de documentos
+- NO respondas directamente preguntas sobre reglas, mecánicas, o información específica del juego
+- Usa la herramienta de búsqueda incluso para preguntas de seguimiento o clarificaciones
 - Considera el contexto de la conversación anterior al formular tus búsquedas
-- Si el usuario hace referencia a algo mencionado anteriormente (como "la tabla que mencionaste"), 
-  incluye ese contexto en tu búsqueda
+- Si el usuario hace referencia a algo mencionado anteriormente, incluye ese contexto en tu búsqueda
 - Responde siempre en español"""
 
 
@@ -84,11 +89,51 @@ def get_llm() -> ChatOllama:
     )
 
 
+def should_use_retrieval(query: str, conversation_history: list) -> bool:
+    """Determine if a query should trigger document retrieval.
+
+    Args:
+        query: The current user query
+        conversation_history: Previous messages in the conversation
+
+    Returns:
+        True if retrieval should be used, False for direct response
+    """
+    # Keywords that strongly indicate document retrieval is needed
+    strong_retrieval_keywords = [
+        'reglas', 'regla', 'mecánicas', 'mecánica', 'manual', 'consulta', 'consultar',
+        'página', 'p.', 'capítulo', 'sección', 'apartado', 'forja', 'creación',
+        'objeto', 'objetos', 'personaje', 'personajes', 'habilidades', 'habilidad',
+        'magia', 'mágico', 'don', 'divino', 'sobrenatural', 'combate', 'lucha',
+        'daño', 'ataque', 'defensa', 'arma', 'armas', 'equipo', 'equipamiento'
+    ]
+
+    # Question words that often need document lookup
+    question_words = ['cómo', 'qué', 'cuál', 'cuáles', 'dónde', 'cuándo', 'por qué']
+
+    query_lower = query.lower()
+
+    # Check for strong retrieval keywords
+    has_strong_keywords = any(keyword in query_lower for keyword in strong_retrieval_keywords)
+
+    # Check for question words combined with game terms
+    has_question = any(word in query_lower for word in question_words)
+
+    # Check if this is a follow-up conversation (likely needs context)
+    is_follow_up = len(conversation_history) > 2  # More than just the current query
+
+    # Force retrieval for:
+    # 1. Queries with strong retrieval keywords
+    # 2. Questions in follow-up conversations
+    # 3. Explicit requests to consult/ check the manual
+    return has_strong_keywords or (has_question and is_follow_up) or 'consulta' in query_lower or 'manual' in query_lower
+
+
 def generate_query_or_respond(state: MessagesState) -> dict:
     """Generate a query using the retriever tool or respond directly.
 
-    This node calls the LLM to decide whether to retrieve documents
-    or respond directly to the user based on the current conversation.
+    This node analyzes the query and decides whether to retrieve documents
+    or respond directly based on keywords and conversation context.
 
     Args:
         state: Current graph state with messages.
@@ -96,14 +141,37 @@ def generate_query_or_respond(state: MessagesState) -> dict:
     Returns:
         Updated state with the LLM response.
     """
-    from langchain_core.messages import SystemMessage
-    
+    from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+
+    # Get the current user message
+    current_query = ""
+    for msg in reversed(state["messages"]):
+        if isinstance(msg, HumanMessage):
+            current_query = msg.content
+            break
+
+    # Check if retrieval is needed
+    needs_retrieval = should_use_retrieval(current_query, state["messages"])
+
+    if needs_retrieval:
+        # Force retrieval by creating a tool call in the correct format
+        tool_call = {
+            "name": "retrieve_documents",
+            "args": {"query": current_query},
+            "id": f"retrieval_{len(state['messages'])}"
+        }
+
+        response = AIMessage(
+            content="Voy a buscar la información relevante en los documentos.",
+            tool_calls=[tool_call]
+        )
+        return {"messages": [response]}
+
+    # For general conversation, use the LLM normally
     llm = get_llm()
     llm_with_tools = llm.bind_tools([retriever_tool])
-    
-    # Prepend system message to provide context instructions
+
     messages = [SystemMessage(content=SYSTEM_MESSAGE)] + list(state["messages"])
-    
     response = llm_with_tools.invoke(messages)
     return {"messages": [response]}
 
@@ -122,9 +190,9 @@ def grade_documents(
     Returns:
         Name of the next node: 'generate_answer' or 'rewrite_question'.
     """
-    # Get the original question (first human message)
+    # Get the current question (last human message to focus on clarifications)
     question = ""
-    for msg in state["messages"]:
+    for msg in reversed(state["messages"]):
         if isinstance(msg, HumanMessage) or (
             hasattr(msg, "type") and msg.type == "human"
         ):
@@ -159,9 +227,9 @@ def rewrite_question(state: MessagesState) -> dict:
     Returns:
         Updated state with the rewritten question.
     """
-    # Get the original question
+    # Get the current question (last human message to focus on clarifications)
     question = ""
-    for msg in state["messages"]:
+    for msg in reversed(state["messages"]):
         if isinstance(msg, HumanMessage) or (
             hasattr(msg, "type") and msg.type == "human"
         ):
@@ -178,7 +246,7 @@ def rewrite_question(state: MessagesState) -> dict:
 def generate_answer(state: MessagesState) -> dict:
     """Generate the final answer using retrieved context.
 
-    This node produces the final response based on the original
+    This node produces the final response based on the current
     question and the relevant retrieved documents.
 
     Args:
@@ -187,9 +255,9 @@ def generate_answer(state: MessagesState) -> dict:
     Returns:
         Updated state with the generated answer.
     """
-    # Get the original question
+    # Get the current question (last human message to focus on clarifications)
     question = ""
-    for msg in state["messages"]:
+    for msg in reversed(state["messages"]):
         if isinstance(msg, HumanMessage) or (
             hasattr(msg, "type") and msg.type == "human"
         ):

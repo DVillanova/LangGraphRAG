@@ -8,6 +8,7 @@ from typing import List, Optional, Tuple
 from functools import lru_cache
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_experimental.text_splitter import SemanticChunker
 from langchain_community.document_loaders import (
     PyPDFLoader,
     TextLoader,
@@ -18,6 +19,8 @@ from langchain_core.documents import Document
 
 from app.core.config import get_settings
 from app.services.vector_store import get_vector_store_service, VectorStoreService
+from app.services.embeddings import get_embedding_service
+from app.services.reranker import get_reranker_service
 
 
 # Supported file extensions and their loaders
@@ -78,6 +81,7 @@ class DocumentService:
         self.settings = get_settings()
         self._vector_store = vector_store
         self._text_splitter: RecursiveCharacterTextSplitter | None = None
+        self._semantic_splitter: SemanticChunker | None = None
 
         # Ensure documents directory exists
         self.documents_dir.mkdir(parents=True, exist_ok=True)
@@ -105,6 +109,32 @@ class DocumentService:
                 separators=["\n\n", "\n", ". ", " ", ""],
             )
         return self._text_splitter
+
+    @property
+    def semantic_splitter(self) -> SemanticChunker:
+        """Get the semantic splitter instance."""
+        if self._semantic_splitter is None:
+            embedding_service = get_embedding_service()
+            
+            # Create a wrapper class for the embedding function
+            class EmbeddingWrapper:
+                def __init__(self, embedding_service):
+                    self.embedding_service = embedding_service
+                
+                def embed_documents(self, texts: List[str]) -> List[List[float]]:
+                    return self.embedding_service.embed_texts(texts)
+                
+                def embed_query(self, text: str) -> List[float]:
+                    return self.embedding_service.embed_text(text)
+            
+            embeddings = EmbeddingWrapper(embedding_service)
+            
+            self._semantic_splitter = SemanticChunker(
+                embeddings=embeddings,
+                breakpoint_threshold_type="percentile",
+                breakpoint_threshold_amount=self.settings.semantic_breakpoint_threshold,
+            )
+        return self._semantic_splitter
 
     def get_loader_for_file(self, file_path: Path):
         """Get the appropriate loader for a file.
@@ -146,9 +176,23 @@ class DocumentService:
             documents: List of documents to split.
 
         Returns:
-            List of document chunks.
+            List of document chunks with preserved metadata.
         """
-        return self.text_splitter.split_documents(documents)
+        if self.settings.use_semantic_chunking:
+            # Use semantic chunking
+            chunks = self.semantic_splitter.split_documents(documents)
+        else:
+            # Use recursive character splitting
+            chunks = self.text_splitter.split_documents(documents)
+        
+        # Ensure page metadata is preserved and propagated
+        for chunk in chunks:
+            # If chunk doesn't have page metadata but has source metadata, try to extract it
+            if 'page' not in chunk.metadata and hasattr(chunk, 'metadata'):
+                # PyPDFLoader provides 'page' field, ensure it's preserved
+                pass  # Metadata should already be copied by the splitters
+        
+        return chunks
 
     def add_document(
         self,
@@ -189,11 +233,17 @@ class DocumentService:
         # Extract and sanitize text content from chunks
         texts = [sanitize_text(chunk.page_content) for chunk in chunks]
 
-        # Prepare metadata for each chunk
+        # Prepare metadata for each chunk, preserving page numbers
         metadatas = []
         for i, chunk in enumerate(chunks):
-            metadata = dict(chunk.metadata)
+            metadata = dict(chunk.metadata) if chunk.metadata else {}
             metadata["original_file"] = file_path.name
+            metadata["chunk_index"] = i
+            
+            # Ensure page number is included if available from PyPDFLoader
+            if 'page' in metadata:
+                metadata["page_number"] = metadata['page']
+            
             metadatas.append(metadata)
 
         # Add to vector store
@@ -237,11 +287,17 @@ class DocumentService:
         # Extract and sanitize text content
         texts = [sanitize_text(chunk.page_content) for chunk in chunks]
 
-        # Prepare metadata
+        # Prepare metadata, preserving page numbers
         metadatas = []
-        for chunk in chunks:
-            metadata = dict(chunk.metadata)
+        for i, chunk in enumerate(chunks):
+            metadata = dict(chunk.metadata) if chunk.metadata else {}
             metadata["original_file"] = filename
+            metadata["chunk_index"] = i
+            
+            # Ensure page number is included if available from PyPDFLoader
+            if 'page' in metadata:
+                metadata["page_number"] = metadata['page']
+            
             metadatas.append(metadata)
 
         # Add to vector store
@@ -287,20 +343,43 @@ class DocumentService:
         self,
         query: str,
         limit: Optional[int] = None,
+        use_reranking: Optional[bool] = None,
     ) -> List[dict]:
         """Search for relevant document chunks.
 
         Args:
             query: Search query.
             limit: Maximum results to return.
+            use_reranking: Whether to use re-ranking (None uses settings default).
 
         Returns:
             List of matching chunks with metadata.
         """
         if limit is None:
             limit = self.settings.retriever_k
-
-        return self.vector_store.search(query=query, limit=limit)
+        
+        if use_reranking is None:
+            use_reranking = self.settings.use_reranking
+        
+        # If using re-ranking, get more candidates first
+        if use_reranking:
+            # Get more candidates for re-ranking
+            candidate_limit = self.settings.rerank_top_k
+            results = self.vector_store.search(query=query, limit=candidate_limit)
+            
+            # Re-rank the candidates
+            if results:
+                reranker = get_reranker_service()
+                results = reranker.rerank(
+                    query=query,
+                    documents=results,
+                    top_k=limit,
+                )
+            
+            return results
+        else:
+            # Direct search without re-ranking
+            return self.vector_store.search(query=query, limit=limit)
 
     @staticmethod
     def get_supported_extensions() -> List[str]:

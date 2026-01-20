@@ -44,6 +44,30 @@ class Settings(BaseSettings):
     embedding_batch_size: int = 100  # Embeddings to generate at once
     upsert_batch_size: int = 50  # Points to upsert to Qdrant at once
 
+    # Language settings
+    language: str = "es"  # Spanish
+    use_spanish_stopwords: bool = False  # Optional BM25 optimization
+
+    # Hybrid search weights (tuned for Spanish)
+    bm25_weight: float = 0.35
+    semantic_weight: float = 0.65
+
+    # Re-ranking settings (Spanish-optimized model)
+    use_reranking: bool = True
+    rerank_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
+    rerank_top_k: int = 20  # Candidates to re-rank
+    final_top_k: int = 6  # Final results
+
+    # Query expansion
+    use_query_expansion: bool = True
+    num_query_variants: int = 3
+    query_expansion_language: str = "es"
+
+    # Semantic chunking
+    use_semantic_chunking: bool = True
+    semantic_chunk_size: int = 1000
+    semantic_breakpoint_threshold: float = 0.5
+
     @property
     def qdrant_url(self) -> str:
         """Get the full Qdrant URL."""

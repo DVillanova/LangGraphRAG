@@ -89,6 +89,7 @@ class SearchResult(BaseModel):
     source: str = Field(..., description="Source document")
     score: float = Field(..., description="Relevance score")
     doc_id: str = Field(..., description="Document ID")
+    page_number: Optional[int] = Field(default=None, description="Page number in source document")
 
 
 class SearchResponse(BaseModel):

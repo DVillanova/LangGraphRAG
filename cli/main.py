@@ -238,7 +238,7 @@ def list_documents():
 
         for doc in documents:
             table.add_row(
-                doc["doc_id"][:8] + "...",
+                doc["doc_id"][:],
                 doc["source"],
                 str(doc["chunk_count"]),
             )
@@ -455,6 +455,185 @@ def initialize():
 def main():
     """Main entry point for the CLI."""
     cli()
+
+
+@cli.command(name="migrate")
+def migrate_index(
+    force: bool = typer.Option(False, "--force", "-f", help="Omitir confirmación / Skip confirmation"),
+):
+    """Re-indexar documentos existentes con nueva funcionalidad. / Re-index existing documents with new features."""
+    console.print(
+        Panel(
+            "[bold yellow]Migración de Índice / Index Migration[/bold yellow]\n\n"
+            "Este comando re-indexará todos los documentos existentes con:\n"
+            "- Chunking semántico mejorado\n"
+            "- Preservación de números de página\n"
+            "- Índice BM25 para búsqueda híbrida\n\n"
+            "This will re-index all existing documents with:\n"
+            "- Improved semantic chunking\n"
+            "- Page number preservation\n"
+            "- BM25 index for hybrid search",
+            title="⚠ Advertencia / Warning",
+        )
+    )
+    
+    # Get document service and vector store
+    doc_service = get_document_service()
+    
+    try:
+        from app.services.vector_store import get_vector_store_service
+        vector_store = get_vector_store_service()
+    except Exception as e:
+        console.print(f"[red]Error connecting to vector store: {e}[/red]")
+        raise typer.Exit(1)
+    
+    # Get list of existing documents
+    try:
+        existing_docs = doc_service.list_documents()
+    except Exception as e:
+        console.print(f"[red]Error listing documents: {e}[/red]")
+        raise typer.Exit(1)
+    
+    if not existing_docs:
+        console.print("[yellow]No documents found to migrate.[/yellow]")
+        return
+    
+    # Show documents that will be migrated
+    console.print(f"\n[bold]Documentos a migrar / Documents to migrate:[/bold] {len(existing_docs)}\n")
+    
+    table = Table()
+    table.add_column("Fuente / Source", style="cyan")
+    table.add_column("Chunks", justify="right", style="magenta")
+    table.add_column("Doc ID", style="dim")
+    
+    for doc in existing_docs[:10]:  # Show first 10
+        table.add_row(
+            doc.get("source", "Unknown"),
+            str(doc.get("chunk_count", 0)),
+            doc.get("doc_id", "")[:8] + "...",
+        )
+    
+    if len(existing_docs) > 10:
+        table.add_row("...", "...", "...", style="dim")
+    
+    console.print(table)
+    
+    # Confirm migration
+    if not force:
+        confirm = console.input(
+            "\n[yellow]¿Continuar con la migración? / Continue with migration? (yes/no):[/yellow] "
+        ).strip().lower()
+        
+        if confirm not in ["yes", "y", "si", "sí", "s"]:
+            console.print("[yellow]Migración cancelada. / Migration cancelled.[/yellow]")
+            return
+    
+    # Clear BM25 index
+    console.print("\n[cyan]Limpiando índice BM25... / Clearing BM25 index...[/cyan]")
+    try:
+        vector_store.bm25_index.clear()
+        console.print("[green]✓ Índice BM25 limpiado / BM25 index cleared[/green]")
+    except Exception as e:
+        console.print(f"[yellow]⚠ Warning clearing BM25 index: {e}[/yellow]")
+    
+    # Get all document files
+    docs_dir = Path(doc_service.documents_dir)
+    doc_files = list(docs_dir.glob("*_*"))  # Files with UUID prefix
+    
+    if not doc_files:
+        console.print("[yellow]No document files found in storage directory.[/yellow]")
+        return
+    
+    console.print(f"\n[bold]Re-indexando {len(doc_files)} archivos... / Re-indexing {len(doc_files)} files...[/bold]\n")
+    
+    # Process each file
+    success_count = 0
+    error_count = 0
+    
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Migrando / Migrating...", total=len(doc_files))
+        
+        for doc_file in doc_files:
+            try:
+                # Extract original filename (after UUID_)
+                filename = "_".join(doc_file.name.split("_")[1:])
+                
+                # Load document
+                documents = doc_service.load_document(doc_file)
+                
+                # Split with new chunking strategy
+                chunks = doc_service.split_documents(documents)
+                
+                # Extract texts and metadata
+                from app.services.document_service import sanitize_text
+                texts = [sanitize_text(chunk.page_content) for chunk in chunks]
+                
+                metadatas = []
+                for i, chunk in enumerate(chunks):
+                    metadata = dict(chunk.metadata) if chunk.metadata else {}
+                    metadata["original_file"] = filename
+                    metadata["chunk_index"] = i
+                    
+                    if 'page' in metadata:
+                        metadata["page_number"] = metadata['page']
+                    
+                    metadatas.append(metadata)
+                
+                # Find and delete old document ID
+                # Extract doc_id from filename (first part before _)
+                old_doc_id = doc_file.name.split("_")[0]
+                
+                # Delete old vectors
+                vector_store.delete_document(old_doc_id)
+                
+                # Add with new indexing
+                import uuid
+                new_doc_id = str(uuid.uuid4())
+                
+                vector_store.add_documents(
+                    texts=texts,
+                    doc_id=new_doc_id,
+                    source=filename,
+                    metadatas=metadatas,
+                )
+                
+                # Rename file with new doc_id
+                new_path = docs_dir / f"{new_doc_id}_{filename}"
+                doc_file.rename(new_path)
+                
+                success_count += 1
+                
+            except Exception as e:
+                console.print(f"\n[red]Error migrating {doc_file.name}: {e}[/red]")
+                error_count += 1
+            
+            progress.update(task, advance=1)
+    
+    # Summary
+    console.print(
+        Panel(
+            f"[bold green]Migración completada / Migration completed[/bold green]\n\n"
+            f"✓ Exitosos / Successful: {success_count}\n"
+            f"✗ Errores / Errors: {error_count}\n\n"
+            f"Total de documentos migrados: {success_count}/{len(doc_files)}",
+            title="✓ Resumen / Summary",
+        )
+    )
+    
+    if success_count > 0:
+        console.print(
+            "\n[green]Los documentos han sido re-indexados con:\n"
+            "- Chunking semántico\n"
+            "- Números de página preservados\n"
+            "- Índice BM25 para búsqueda híbrida[/green]"
+        )
 
 
 if __name__ == "__main__":
